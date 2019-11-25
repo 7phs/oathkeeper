@@ -15,6 +15,8 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 
@@ -32,16 +34,19 @@ import (
 )
 
 type event struct {
-	et     eventType
+	et     EventType
 	path   url.URL
 	source string
 }
 
-type eventType int
+type EventType int
 
 const (
-	eventRepositoryConfigChange eventType = iota
-	eventFileChanged
+	EventRepositoryConfigChange EventType = iota
+	EventFileChanged
+
+	errDurationStep    = 100 * time.Millisecond
+	maxErrDurationWait = 15 * time.Second
 )
 
 var _ Fetcher = new(FetcherDefault)
@@ -65,7 +70,9 @@ type FetcherDefault struct {
 	wg   sync.WaitGroup
 
 	// DIRTY HACK
-	events chan event
+	shutdown          chan interface{}
+	events            chan event
+	errWaitForTheNext time.Duration
 }
 
 func NewFetcherDefault(
@@ -77,6 +84,8 @@ func NewFetcherDefault(
 		c:     c,
 		hc:    httpx.NewResilientClientLatencyToleranceHigh(nil),
 		cache: map[string][]Rule{},
+		// DIRTY HACK
+		shutdown: make(chan interface{}),
 	}
 }
 
@@ -131,6 +140,7 @@ func (f *FetcherDefault) configUpdate(ctx context.Context, watcher *fsnotify.Wat
 
 	// If there are no more sources to watch we reset the rule repository as a whole
 	if len(replace) == 0 {
+		f.r.Logger().WithField("repos", viper.AllSettings()).Warn("No access rule repositories have been defined in the updated config.")
 		if err := f.r.RuleRepository().Set(ctx, []Rule{}); err != nil {
 			return err
 		}
@@ -138,7 +148,7 @@ func (f *FetcherDefault) configUpdate(ctx context.Context, watcher *fsnotify.Wat
 
 	// Let's fetch all of the repos
 	for _, source := range replace {
-		f.enqueueEvent(events, event{et: eventFileChanged, path: source, source: "config_update"})
+		f.enqueueEvent(events, event{et: EventFileChanged, path: source, source: "config_update"})
 	}
 
 	return nil
@@ -184,6 +194,7 @@ func (f *FetcherDefault) Watch(ctx context.Context) error {
 
 	err = f.watch(ctx, watcher, events)
 
+	close(f.shutdown)
 	// Close the channel only when all child goroutines exit
 	f.wg.Wait()
 	close(events)
@@ -196,8 +207,16 @@ func (f *FetcherDefault) setEvents(events chan event) {
 	f.events = events
 }
 
-func (f *FetcherDefault) NotifyEvent() {
-	f.enqueueEvent(f.events, event{et: eventRepositoryConfigChange, source: "notify"})
+func (f *FetcherDefault) NotifyEvent(et interface{}) {
+	switch v := et.(type) {
+	case EventType:
+		switch v {
+		case EventRepositoryConfigChange:
+			f.enqueueEvent(f.events, event{et: v, source: "notify"})
+		}
+	case event:
+		f.enqueueEvent(f.events, v)
+	}
 }
 
 func (f *FetcherDefault) watch(ctx context.Context, watcher *fsnotify.Watcher, events chan event) error {
@@ -210,12 +229,12 @@ func (f *FetcherDefault) watch(ctx context.Context, watcher *fsnotify.Watcher, e
 			return nil
 		}
 
-		f.enqueueEvent(events, event{et: eventRepositoryConfigChange, source: "viper_watcher"})
+		f.enqueueEvent(events, event{et: EventRepositoryConfigChange, source: "viper_watcher"})
 
 		return nil
 	})
 
-	f.enqueueEvent(events, event{et: eventRepositoryConfigChange, source: "entrypoint"})
+	f.enqueueEvent(events, event{et: EventRepositoryConfigChange, source: "entrypoint"})
 
 	for {
 		select {
@@ -251,34 +270,50 @@ func (f *FetcherDefault) watch(ctx context.Context, watcher *fsnotify.Watcher, e
 				WithField("op", e.Op.String()).
 				Debugf("Detected file change in directory containing access rules. Triggering a reload.")
 
-			f.enqueueEvent(events, event{et: eventRepositoryConfigChange, source: "fsnotify"})
+			f.enqueueEvent(events, event{et: EventRepositoryConfigChange, source: "fsnotify"})
+
 		case e, ok := <-events:
 			if !ok {
 				// channel was closed
+				f.r.Logger().Debug("The events channel was closed")
 				return nil
 			}
 
 			switch e.et {
-			case eventRepositoryConfigChange:
+			case EventRepositoryConfigChange:
 				f.r.Logger().
 					WithField("event", "config_change").
 					WithField("source", e.source).
-					Debugf("Access rule watcher received an update.")
+					Debugf("Viper detected a configuration change, reloading config.")
 				if err := f.configUpdate(ctx, watcher, f.c.AccessRuleRepositories(), events); err != nil {
 					return err
 				}
-			case eventFileChanged:
+			case EventFileChanged:
 				f.r.Logger().
 					WithField("event", "repository_change").
 					WithField("source", e.source).
 					WithField("file", e.path.String()).
-					Debugf("Access rule watcher received an update.")
+					Debugf("One or more access rule repositories changed, reloading access rules.")
 
 				rules, err := f.sourceUpdate(e)
 				if err != nil {
+					errWaitForTheNext := f.getWaitingRetry()
+
 					f.r.Logger().WithError(err).
 						WithField("file", e.path.String()).
-						Error("Unable to update access rules from given location, changes will be ignored. Check the configuration or restart the service if the issue persists.")
+						Error("Unable to update access rules from given location, try to reload in ", errWaitForTheNext)
+
+					f.wg.Add(1)
+					go func() {
+						defer f.wg.Done()
+
+						select {
+						case <-f.shutdown:
+							return
+						case <-time.After(errWaitForTheNext):
+							f.NotifyEvent(e)
+						}
+					}()
 					continue
 				}
 
@@ -288,6 +323,22 @@ func (f *FetcherDefault) watch(ctx context.Context, watcher *fsnotify.Watcher, e
 			}
 		}
 	}
+}
+
+func (f *FetcherDefault) getWaitingRetry() time.Duration {
+	errWaitForTheNext := time.Duration(
+		atomic.AddInt64((*int64)(&f.errWaitForTheNext),
+			atomic.LoadInt64((*int64)(&f.errWaitForTheNext)),
+		))
+	switch {
+	case errWaitForTheNext == 0:
+		errWaitForTheNext = errDurationStep
+		atomic.CompareAndSwapInt64((*int64)(&f.errWaitForTheNext), 0, int64(errWaitForTheNext))
+	case errWaitForTheNext > maxErrDurationWait:
+		errWaitForTheNext = maxErrDurationWait
+	}
+
+	return errWaitForTheNext
 }
 
 func (f *FetcherDefault) enqueueEvent(events chan event, evt event) {

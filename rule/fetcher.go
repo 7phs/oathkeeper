@@ -25,5 +25,5 @@ import "context"
 type Fetcher interface {
 	Watch(ctx context.Context) error
 	// DIRTY HACK:
-	NotifyEvent()
+	NotifyEvent(et interface{})
 }

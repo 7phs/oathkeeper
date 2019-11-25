@@ -138,7 +138,7 @@ func (h *RuleHandler) getRules(w http.ResponseWriter, r *http.Request, ps httpro
 //       404: genericError
 //       500: genericError
 func (h *RuleHandler) notifyRules(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-	h.r.RuleFetcher().NotifyEvent()
+	h.r.RuleFetcher().NotifyEvent(rule.EventRepositoryConfigChange)
 
 	h.r.Writer().WriteCode(w, r, http.StatusOK, nil)
 }

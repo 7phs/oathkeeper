@@ -1,7 +1,6 @@
 package authn
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -9,9 +8,11 @@ import (
 
 	"golang.org/x/oauth2"
 
-	"github.com/ory/oathkeeper/driver/configuration"
-	"github.com/ory/oathkeeper/pipeline"
 	"github.com/ory/x/httpx"
+
+	"github.com/ory/oathkeeper/driver/configuration"
+
+	"github.com/ory/oathkeeper/pipeline"
 
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2/clientcredentials"
@@ -20,9 +21,8 @@ import (
 )
 
 type AuthenticatorOAuth2Configuration struct {
-	// Scopes is an array of OAuth 2.0 scopes that are required when accessing an endpoint protected by this rule.
-	// If the token used in the Authorization header did not request that specific scope, the request is denied.
-	Scopes []string `json:"required_scope"`
+	Scopes   []string `json:"required_scope"`
+	TokenURL string   `json:"token_url"`
 }
 
 type AuthenticatorOAuth2ClientCredentials struct {
@@ -37,28 +37,28 @@ func (a *AuthenticatorOAuth2ClientCredentials) GetID() string {
 	return "oauth2_client_credentials"
 }
 
-func (a *AuthenticatorOAuth2ClientCredentials) Validate() error {
-	if !a.c.AuthenticatorOAuth2ClientCredentialsIsEnabled() {
-		return errors.WithStack(ErrAuthenticatorNotEnabled.WithReasonf(`Authenticator "%s" is disabled per configuration.`, a.GetID()))
+func (a *AuthenticatorOAuth2ClientCredentials) Validate(config json.RawMessage) error {
+	if !a.c.AuthenticatorIsEnabled(a.GetID()) {
+		return NewErrAuthenticatorNotEnabled(a)
 	}
 
-	if a.c.AuthenticatorOAuth2ClientCredentialsTokenURL() == nil {
-		return errors.WithStack(ErrAuthenticatorNotEnabled.WithReasonf(`Configuration for authenticator "%s" did not specify any values for configuration key "%s" and is thus disabled.`, a.GetID(), configuration.ViperKeyAuthenticatorClientCredentialsTokenURL))
+	_, err := a.Config(config)
+	return err
+}
+
+func (a *AuthenticatorOAuth2ClientCredentials) Config(config json.RawMessage) (*AuthenticatorOAuth2Configuration, error) {
+	var c AuthenticatorOAuth2Configuration
+	if err := a.c.AuthenticatorConfig(a.GetID(), config, &c); err != nil {
+		return nil, NewErrAuthenticatorMisconfigured(a, err)
 	}
 
-	return nil
+	return &c, nil
 }
 
 func (a *AuthenticatorOAuth2ClientCredentials) Authenticate(r *http.Request, config json.RawMessage, _ pipeline.Rule) (*AuthenticationSession, error) {
-	var cf AuthenticatorOAuth2Configuration
-	if len(config) == 0 {
-		config = []byte("{}")
-	}
-
-	d := json.NewDecoder(bytes.NewBuffer(config))
-	d.DisallowUnknownFields()
-	if err := d.Decode(&cf); err != nil {
-		return nil, errors.WithStack(err)
+	cf, err := a.Config(config)
+	if err != nil {
+		return nil, err
 	}
 
 	user, password, ok := r.BasicAuth()
@@ -66,7 +66,6 @@ func (a *AuthenticatorOAuth2ClientCredentials) Authenticate(r *http.Request, con
 		return nil, errors.WithStack(ErrAuthenticatorNotResponsible)
 	}
 
-	var err error
 	user, err = url.QueryUnescape(user)
 	if err != nil {
 		return nil, errors.Wrapf(helper.ErrUnauthorized, err.Error())
@@ -81,7 +80,8 @@ func (a *AuthenticatorOAuth2ClientCredentials) Authenticate(r *http.Request, con
 		ClientID:     user,
 		ClientSecret: password,
 		Scopes:       cf.Scopes,
-		TokenURL:     a.c.AuthenticatorOAuth2ClientCredentialsTokenURL().String(),
+		TokenURL:     cf.TokenURL,
+		AuthStyle:    oauth2.AuthStyleInHeader,
 	}
 
 	token, err := c.Token(context.WithValue(

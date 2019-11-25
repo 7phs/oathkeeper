@@ -28,6 +28,8 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/tidwall/sjson"
+
 	"github.com/ory/viper"
 
 	"github.com/ory/oathkeeper/driver/configuration"
@@ -105,6 +107,8 @@ func TestAuthorizerKetoWarden(t *testing.T) {
 			r: &http.Request{URL: &url.URL{}},
 			setup: func(t *testing.T) *httptest.Server {
 				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Contains(t, r.Header, "Content-Type")
+					assert.Contains(t, r.Header["Content-Type"], "application/json")
 					assert.Contains(t, r.URL.Path, "exact")
 					w.Write([]byte(`{"allowed":false}`))
 				}))
@@ -164,22 +168,49 @@ func TestAuthorizerKetoWarden(t *testing.T) {
 			session:   &authn.AuthenticationSession{Extra: map[string]interface{}{"name": "peter"}},
 			expectErr: false,
 		},
+		{
+			config: []byte(`{ "required_action": "action:$1:$2", "required_resource": "resource:$1:$2", "subject": "{{ .Extra.name }}" }`),
+			rule: &rule.Rule{
+				Match: rule.RuleMatch{
+					Methods: []string{"POST"},
+					URL:     "https://localhost/api/users/<[0-9]+>/<[a-z]+>",
+				},
+			},
+			r: &http.Request{URL: urlx.ParseOrPanic("https://localhost/api/users/1234/abcde?limit=10")},
+			setup: func(t *testing.T) *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var ki AuthorizerKetoEngineACPORYRequestBody
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&ki))
+					assert.EqualValues(t, AuthorizerKetoEngineACPORYRequestBody{
+						Action:   "action:1234:abcde",
+						Resource: "resource:1234:abcde",
+						Context:  map[string]interface{}{},
+						Subject:  "peter",
+					}, ki)
+					assert.Contains(t, r.URL.Path, "regex")
+					w.Write([]byte(`{"allowed":true}`))
+				}))
+			},
+			session:   &authn.AuthenticationSession{Extra: map[string]interface{}{"name": "peter"}},
+			expectErr: false,
+		},
 	} {
 		t.Run(fmt.Sprintf("case=%d", k), func(t *testing.T) {
 			c := gomock.NewController(t)
 			defer c.Finish()
 
-			viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYBaseURL, "http://73fa403f-7e9c-48ef-870f-d21b2c34fc80c6cb6404-bb36-4e70-8b90-45155657fda6/")
+			baseURL := "http://73fa403f-7e9c-48ef-870f-d21b2c34fc80c6cb6404-bb36-4e70-8b90-45155657fda6/"
 			if tc.setup != nil {
 				ts := tc.setup(t)
 				defer ts.Close()
-				viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYBaseURL, ts.URL)
+				baseURL = ts.URL
 			}
 
 			a.(*AuthorizerKetoEngineACPORY).WithContextCreator(func(r *http.Request) map[string]interface{} {
 				return map[string]interface{}{}
 			})
 
+			tc.config, _ = sjson.SetBytes(tc.config, "base_url", baseURL)
 			err := a.Authorize(tc.r, tc.session, tc.config, tc.rule)
 			if tc.expectErr {
 				require.Error(t, err)
@@ -191,19 +222,15 @@ func TestAuthorizerKetoWarden(t *testing.T) {
 
 	t.Run("method=validate", func(t *testing.T) {
 		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYIsEnabled, false)
-		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYBaseURL, "")
-		require.Error(t, a.Validate())
+		require.Error(t, a.Validate(json.RawMessage(`{"base_url":"","required_action":"foo","required_resource":"bar"}`)))
 
 		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYIsEnabled, true)
-		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYBaseURL, "")
-		require.Error(t, a.Validate())
+		require.Error(t, a.Validate(json.RawMessage(`{"base_url":"","required_action":"foo","required_resource":"bar"}`)))
 
 		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYIsEnabled, false)
-		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYBaseURL, "http://foo/bar")
-		require.Error(t, a.Validate())
+		require.Error(t, a.Validate(json.RawMessage(`{"base_url":"http://foo/bar","required_action":"foo","required_resource":"bar"}`)))
 
 		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYIsEnabled, true)
-		viper.Set(configuration.ViperKeyAuthorizerKetoEngineACPORYBaseURL, "http://foo/bar")
-		require.NoError(t, a.Validate())
+		require.NoError(t, a.Validate(json.RawMessage(`{"base_url":"http://foo/bar","required_action":"foo","required_resource":"bar"}`)))
 	})
 }

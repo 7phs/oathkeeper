@@ -29,13 +29,13 @@ import (
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
+	"github.com/tidwall/sjson"
 
-	"github.com/ory/viper"
+	"github.com/ory/x/urlx"
 
-	"github.com/ory/oathkeeper/driver/configuration"
+	"github.com/ory/herodot"
 	"github.com/ory/oathkeeper/internal"
 	. "github.com/ory/oathkeeper/pipeline/authn"
-	"github.com/ory/x/urlx"
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
@@ -50,7 +50,7 @@ func TestAuthenticatorJWT(t *testing.T) {
 		"file://../../test/stub/jwks-ecdsa.json",
 	}
 	conf := internal.NewConfigurationWithDefaults()
-	viper.Set(configuration.ViperKeyAuthenticatorJWTJWKSURIs, keys)
+	// viper.Set(configuration.ViperKeyAuthenticatorJWTJWKSURIs, keys)
 	reg := internal.NewRegistry(conf)
 
 	a, err := reg.PipelineAuthenticator("jwt")
@@ -67,12 +67,14 @@ func TestAuthenticatorJWT(t *testing.T) {
 
 	t.Run("method=authenticate", func(t *testing.T) {
 		for k, tc := range []struct {
-			setup      func()
-			d          string
-			r          *http.Request
-			config     string
-			expectErr  bool
-			expectSess *AuthenticationSession
+			setup          func()
+			d              string
+			r              *http.Request
+			config         string
+			expectErr      bool
+			expectExactErr error
+			expectCode     int
+			expectSess     *AuthenticationSession
 		}{
 			{
 				d:         "should fail because no payloads",
@@ -85,10 +87,70 @@ func TestAuthenticatorJWT(t *testing.T) {
 				expectErr: true,
 			},
 			{
-				d: "should pass because JWT is valid",
-				setup: func() {
-					viper.Set(configuration.ViperKeyAuthenticatorJWTScopeStrategy, "exact")
+				d: "should return error saying that authenticator is not responsible for validating the request, as the token was not provided in a proper location (default)",
+				r: &http.Request{Header: http.Header{"Foobar": []string{"bearer " + gen(keys[1], jwt.MapClaims{
+					"sub": "sub",
+					"exp": now.Add(time.Hour).Unix(),
+				})}}},
+				expectErr:      true,
+				expectExactErr: ErrAuthenticatorNotResponsible,
+			},
+			{
+				d: "should return error saying that authenticator is not responsible for validating the request, as the token was not provided in a proper location (custom header)",
+				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[1], jwt.MapClaims{
+					"sub": "sub",
+					"exp": now.Add(time.Hour).Unix(),
+				})}}},
+				config:         `{"token_from": {"header": "X-Custom-Header"}}`,
+				expectErr:      true,
+				expectExactErr: ErrAuthenticatorNotResponsible,
+			},
+			{
+				d: "should return error saying that authenticator is not responsible for validating the request, as the token was not provided in a proper location (custom query parameter)",
+				r: &http.Request{
+					Form: map[string][]string{
+						"someOtherQueryParam": []string{
+							gen(keys[1], jwt.MapClaims{
+								"sub": "sub",
+								"exp": now.Add(time.Hour).Unix(),
+							}),
+						},
+					},
+					Header: http.Header{"Authorization": []string{"bearer " + gen(keys[1], jwt.MapClaims{
+						"sub": "sub",
+						"exp": now.Add(time.Hour).Unix(),
+					})}},
 				},
+				config:         `{"token_from": {"query_parameter": "token"}}`,
+				expectErr:      true,
+				expectExactErr: ErrAuthenticatorNotResponsible,
+			},
+			{
+				d: "should pass because the valid JWT token was provided in a proper location (custom header)",
+				r: &http.Request{Header: http.Header{"X-Custom-Header": []string{gen(keys[1], jwt.MapClaims{
+					"sub": "sub",
+					"exp": now.Add(time.Hour).Unix(),
+				})}}},
+				config:    `{"token_from": {"header": "X-Custom-Header"}}`,
+				expectErr: false,
+			},
+			{
+				d: "should pass because the valid JWT token was provided in a proper location (custom query parameter)",
+				r: &http.Request{
+					Form: map[string][]string{
+						"token": []string{
+							gen(keys[1], jwt.MapClaims{
+								"sub": "sub",
+								"exp": now.Add(time.Hour).Unix(),
+							}),
+						},
+					},
+				},
+				config:    `{"token_from": {"query_parameter": "token"}}`,
+				expectErr: false,
+			},
+			{
+				d: "should pass because JWT is valid",
 				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[1], jwt.MapClaims{
 					"sub":   "sub",
 					"exp":   now.Add(time.Hour).Unix(),
@@ -96,7 +158,7 @@ func TestAuthenticatorJWT(t *testing.T) {
 					"iss":   "iss-2",
 					"scope": []string{"scope-3", "scope-2", "scope-1"},
 				})}}},
-				config:    `{"target_audience": ["aud-1", "aud-2"], "trusted_issuers": ["iss-1", "iss-2"], "required_scope": ["scope-1", "scope-2"]}`,
+				config:    `{"target_audience": ["aud-1", "aud-2"], "trusted_issuers": ["iss-1", "iss-2"], "required_scope": ["scope-1", "scope-2"], "scope_strategy":"exact"}`,
 				expectErr: false,
 				expectSess: &AuthenticationSession{
 					Subject: "sub",
@@ -111,9 +173,6 @@ func TestAuthenticatorJWT(t *testing.T) {
 			},
 			{
 				d: "should pass because JWT scope can be a string",
-				setup: func() {
-					viper.Set(configuration.ViperKeyAuthenticatorJWTScopeStrategy, "exact")
-				},
 				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[2], jwt.MapClaims{
 					"sub":   "sub",
 					"exp":   now.Add(time.Hour).Unix(),
@@ -121,7 +180,7 @@ func TestAuthenticatorJWT(t *testing.T) {
 					"iss":   "iss-2",
 					"scope": "scope-3 scope-2 scope-1",
 				})}}},
-				config:    `{"target_audience": ["aud-1", "aud-2"], "trusted_issuers": ["iss-1", "iss-2"], "required_scope": ["scope-1", "scope-2"]}`,
+				config:    `{"target_audience": ["aud-1", "aud-2"], "trusted_issuers": ["iss-1", "iss-2"], "required_scope": ["scope-1", "scope-2"], "scope_strategy":"exact"}`,
 				expectErr: false,
 				expectSess: &AuthenticationSession{
 					Subject: "sub",
@@ -136,9 +195,6 @@ func TestAuthenticatorJWT(t *testing.T) {
 			},
 			{
 				d: "should pass because JWT is valid and HS256 is allowed",
-				setup: func() {
-					viper.Set(configuration.ViperKeyAuthenticatorJWTScopeStrategy, "none")
-				},
 				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[0], jwt.MapClaims{
 					"sub": "sub",
 					"exp": now.Add(time.Hour).Unix(),
@@ -152,9 +208,6 @@ func TestAuthenticatorJWT(t *testing.T) {
 			},
 			{
 				d: "should pass because JWT is valid and ES256 is allowed",
-				setup: func() {
-					viper.Set(configuration.ViperKeyAuthenticatorJWTScopeStrategy, "none")
-				},
 				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[3], jwt.MapClaims{
 					"sub": "sub",
 					"exp": now.Add(time.Hour).Unix(),
@@ -182,8 +235,9 @@ func TestAuthenticatorJWT(t *testing.T) {
 					"exp": now.Add(time.Hour).Unix(),
 					"nbf": now.Add(time.Hour).Unix(),
 				})}}},
-				config:    `{}`,
-				expectErr: true,
+				config:     `{}`,
+				expectErr:  true,
+				expectCode: 401,
 			},
 			{
 				d: "should fail because JWT iat is in future",
@@ -192,11 +246,12 @@ func TestAuthenticatorJWT(t *testing.T) {
 					"exp": now.Add(time.Hour).Unix(),
 					"iat": now.Add(time.Hour).Unix(),
 				})}}},
-				config:    `{}`,
-				expectErr: true,
+				config:     `{}`,
+				expectErr:  true,
+				expectCode: 401,
 			},
 			{
-				d: "should pass because JWT is missing scope",
+				d: "should fail because JWT is missing scope",
 				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[2], jwt.MapClaims{
 					"sub":   "sub",
 					"exp":   now.Add(time.Hour).Unix(),
@@ -206,7 +261,7 @@ func TestAuthenticatorJWT(t *testing.T) {
 				expectErr: true,
 			},
 			{
-				d: "should pass because JWT issuer is untrusted",
+				d: "should fail because JWT issuer is untrusted",
 				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[1], jwt.MapClaims{
 					"sub": "sub",
 					"exp": now.Add(time.Hour).Unix(),
@@ -216,7 +271,7 @@ func TestAuthenticatorJWT(t *testing.T) {
 				expectErr: true,
 			},
 			{
-				d: "should pass because JWT is missing audience",
+				d: "should fail because JWT is missing audience",
 				r: &http.Request{Header: http.Header{"Authorization": []string{"bearer " + gen(keys[1], jwt.MapClaims{
 					"sub": "sub",
 					"exp": now.Add(time.Hour).Unix(),
@@ -231,8 +286,9 @@ func TestAuthenticatorJWT(t *testing.T) {
 					"sub": "sub",
 					"exp": now.Add(-time.Hour).Unix(),
 				})}}},
-				config:    `{}`,
-				expectErr: true,
+				config:     `{}`,
+				expectErr:  true,
+				expectCode: 401,
 			},
 		} {
 			t.Run(fmt.Sprintf("case=%d/description=%s", k, tc.d), func(t *testing.T) {
@@ -240,9 +296,16 @@ func TestAuthenticatorJWT(t *testing.T) {
 					tc.setup()
 				}
 
+				tc.config, _ = sjson.Set(tc.config, "jwks_urls", keys)
 				session, err := a.Authenticate(tc.r, json.RawMessage([]byte(tc.config)), nil)
 				if tc.expectErr {
 					require.Error(t, err)
+					if tc.expectCode != 0 {
+						assert.Equal(t, tc.expectCode, herodot.ToDefaultError(err, "").StatusCode(), "Status code mismatch")
+					}
+					if tc.expectExactErr != nil {
+						assert.EqualError(t, err, tc.expectExactErr.Error())
+					}
 				} else {
 					require.NoError(t, err, "%#v", errors.Cause(err))
 				}
@@ -252,9 +315,5 @@ func TestAuthenticatorJWT(t *testing.T) {
 				}
 			})
 		}
-	})
-
-	t.Run("method=validate", func(t *testing.T) {
-
 	})
 }
